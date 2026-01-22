@@ -25,6 +25,39 @@ def parse_ob_end_time(series):
     d = d.fillna(pd.to_datetime(s, errors="coerce", dayfirst=True))
     return d
 
+def size_collector_area_from_annual_total(annual_demand, annual_input_per_m2):
+    """
+    annual_demand: m3/year (for rain) OR kWh/year (for solar)
+    annual_input_per_m2: Series indexed by year with units:
+        - rain: m3 per m2 per year
+        - solar: kWh per m2 per year
+    Returns: (area_typical, area_worst, worst_year)
+    """
+    req_area_by_year = annual_demand / annual_input_per_m2
+    area_typical = float(req_area_by_year.median())
+    area_worst = float(req_area_by_year.max())  # worst year => biggest area
+    worst_year = int(req_area_by_year.idxmax().year if hasattr(req_area_by_year.idxmax(), "year") else req_area_by_year.idxmax())
+    return area_typical, area_worst, worst_year
+
+def storage_needed_by_year(net_daily):
+    net_daily = net_daily.dropna().sort_index()
+    def one_year_storage(x):
+        cum = x.cumsum()
+        drawdown = cum.cummax() - cum
+        return float(drawdown.max())
+    return net_daily.groupby(net_daily.index.year).apply(one_year_storage)
+
+def report_storage_logic(net_per_day, label="Storage"):
+    """
+    net_per_day: Series in (m3/day) or (kWh/day). Positive=charging/filling, negative=draining.
+    Prints the worst drawdown (storage requirement) and the year it occurs.
+    """
+    by_year = storage_needed_by_year(net_per_day)
+    design = float(by_year.max())
+    design_year = int(by_year.idxmax())
+    print(f"{label} capacity needed (worst drawdown): {design:.3f} in year {design_year}")
+    return by_year, design, design_year
+
 # Source - https://stackoverflow.com/a
 # Posted by Gaurav Singh, modified by community. See post 'Timeline' for change history
 # Retrieved 2026-01-16, License - CC BY-SA 4.0
@@ -74,26 +107,51 @@ rain_daily_mm = (
 annual_water_m3 = 200.0
 demand_m3_day = annual_water_m3 / 365.0
 
+rain_daily_mm = rain_daily_mm.fillna(0.0)
+rain_daily_mm = rain_daily_mm.asfreq("D", fill_value=0.0) # Ensure continuous daily series; missing days = 0 mm rain
+
 rain_m3_m2_day = (rain_daily_mm / 1000.0) # mm/day -> m/day; m³ per m² per day
 
-rain_annual_mm = rain_daily_mm.resample("YE").sum(min_count=1).dropna() # Catchment sizing (m²) to meet 200 m³/yr using worst year
-rain_annual_m3_per_m2 = rain_annual_mm / 1000.0  # m³ per m² per year
+# --- STEP 1: COLLECTOR SIZING (CATCHMENT AREA) ---
+rain_annual_mm = rain_daily_mm.resample("YE").sum(min_count=1).dropna()
+rain_annual_m3_per_m2 = rain_annual_mm / 1000.0  # (m/year) == m3 per m2 per year
 
-catchment_required_by_year = annual_water_m3 / rain_annual_m3_per_m2
-catchment_typical = float(catchment_required_by_year.median())
-catchment_worst = float(catchment_required_by_year.max())
+catchment_typical, catchment_worst, driest_year_by_area = size_collector_area_from_annual_total(
+    annual_water_m3, rain_annual_m3_per_m2
+)
 
-inflow_m3_day = rain_m3_m2_day * catchment_worst
-net_m3_day = inflow_m3_day - demand_m3_day
+print("\nRAIN COLLECTOR (AREA) SIZING")
+print(f"Annual demand: {annual_water_m3:.1f} m³/yr")
+print(f"Typical catchment area (median year): {catchment_typical:.2f} m²")
+print(f"Worst-year catchment area (driest year): {catchment_worst:.2f} m² (driven by year {driest_year_by_area})")
 
-tank_m3, tank_drawdown, tank_cum = required_storage_from_net(net_m3_day)
-print("Tank capacity needed based on worst rain (m³):", tank_m3)
+# Choose design area (fixed)
+catchment_area_m2 = catchment_worst
+
+# --- STEP 2: STORAGE SIZING (TANK VOLUME) using FIXED catchment area ---
+net_m3_day = (rain_m3_m2_day * catchment_area_m2) - demand_m3_day
+
+print("\nRAIN STORAGE (TANK) SIZING")
+tank_need_by_year, tank_design_m3, tank_design_year = report_storage_logic(net_m3_day, label="Tank (m³)")
+
+# Helpful “why tank can go down” diagnostics:
+daily_inflow_m3 = rain_m3_m2_day * catchment_area_m2
+print(f"Median daily inflow (when it rains) with this area: {daily_inflow_m3[rain_daily_mm>0].median():.3f} m³/day")
+print(f"Longest dry spell (consecutive 0 mm days): {(rain_daily_mm==0).astype(int).groupby((rain_daily_mm!=0).cumsum()).sum().max()} days")
 
 # 1mm of rain = 1L of water/m^2 of perfectly flat area.
 # therefore need an area that the rain is being collected in to reach the desired volume.
 
 # prcp_amt = precipitation 
 # prcp_dur = precipitation duration
+
+
+
+
+
+
+
+
 
 # --------------------------------------
 # SOLAR DATA EXTRACTION AND ORGANISATION
@@ -120,11 +178,11 @@ solar_hourly = solar_frame[solar_frame["ob_hour_count"] == 1].dropna(
 
 solar_hourly["hour"] = solar_hourly["ob_end_time"].dt.floor("h")
 
-solar_hourly_hourly = (
+solar_hourly_series = (
     solar_hourly.groupby("hour")["glbl_irad_amt"].mean().sort_index()
 )
 
-solar_daily_from_hourly = solar_hourly_hourly.resample("D").sum(min_count=1) # daily series made by summing hourly values
+solar_daily_from_hourly = solar_hourly_series.resample("D").sum(min_count=1) # daily series made by summing hourly values
 
 solar_daily_direct = solar_frame[solar_frame["ob_hour_count"] == 24].dropna(
     subset=["ob_end_time", "glbl_irad_amt"]
@@ -160,29 +218,49 @@ solar_daily_all = solar_daily_from_hourly.combine_first(solar_daily_direct).sort
 
 pv_eff = 0.15 # efficiency
 annual_demand_kwh = 5000
+daily_demand_kwh = annual_demand_kwh / 365.0
 solar_daily_kj_m2 = solar_daily_all
+
+# Ensure continuous daily series for solar
+solar_daily_kj_m2 = solar_daily_kj_m2.asfreq("D")
+
+# Fill missing days with the median for that calendar month (robust)
+month_median = solar_daily_kj_m2.groupby(solar_daily_kj_m2.index.month).transform("median")
+solar_daily_kj_m2 = solar_daily_kj_m2.fillna(month_median)
+
+# If any NaNs remain (e.g. an entire month missing), fall back to overall median
+solar_daily_kj_m2 = solar_daily_kj_m2.fillna(solar_daily_kj_m2.median())
 
 solar_kwh_m2 = solar_daily_kj_m2 / 3600.0 # kWh/m²/day incident
 solar_elec_kwh_m2 = solar_kwh_m2 * pv_eff # kWh/m²/day electricity produced per m² of solar pannels
 
-solar_annual_per_m2 = solar_elec_kwh_m2.resample("YE").sum(min_count=1) # kWh/m²/year
+# --- STEP 1: COLLECTOR SIZING (PANEL AREA) ---
+solar_annual_kwh_m2 = solar_elec_kwh_m2.resample("YE").sum(min_count=1).dropna()  # kWh/m²/year
 
-area_required_by_year = annual_demand_kwh / solar_annual_per_m2 # Area needed per year
+panel_typical, panel_worst, worst_solar_year_by_area = size_collector_area_from_annual_total(
+    annual_demand_kwh,
+    solar_annual_kwh_m2
+)
 
-area_typical = area_required_by_year.median() # typical area required based on solar radiation in
-area_worst = area_required_by_year.max() # worst solar year needs biggest area
-area_p90 = area_required_by_year.quantile(0.9)
+print("\nSOLAR COLLECTOR (PANEL AREA) SIZING")
+print(f"Annual demand: {annual_demand_kwh:.0f} kWh/yr")
+print(f"Typical panel area (median year): {panel_typical:.2f} m²")
+print(f"Worst-year panel area (lowest solar year): {panel_worst:.2f} m² (driven by year {worst_solar_year_by_area})")
 
-daily_demand_kwh = annual_demand_kwh / 365.0
+# Choose design panel area (fixed)
+panel_area_m2 = panel_worst
 
-for label, panel_area_m2 in [("typical", area_typical), ("worst", area_worst)]:
-    gen_kwh_day = solar_elec_kwh_m2 * panel_area_m2
-    net_kwh_day = gen_kwh_day - daily_demand_kwh
-    battery_kwh, _, _ = required_storage_from_net(net_kwh_day)
-    print(f"Battery needed (kWh) using {label} panel area:", battery_kwh)
 
-print("typical area required for solar pannels (m²)", area_typical)
-print("worst area required for solar pannels (m²)", area_worst)
+# --- STEP 2: STORAGE SIZING (BATTERY) using FIXED panel area ---
+gen_kwh_day = solar_elec_kwh_m2 * panel_area_m2
+net_kwh_day = gen_kwh_day - daily_demand_kwh
+
+print("\nSOLAR STORAGE (BATTERY) SIZING")
+battery_need_by_year, battery_design_kwh, battery_design_year = report_storage_logic(net_kwh_day, label="Battery (kWh)")
+
+# Optional: helps you *explain* the analogy in the presentation
+print(f"Median daily generation with this panel area: {gen_kwh_day.median():.2f} kWh/day")
+print(f"Worst single-day net (most negative): {net_kwh_day.min():.2f} kWh/day")
 
 # ------------------------------------
 # SEASONAL ANALYSIS PLOTS (OVER YEARS)
@@ -226,7 +304,7 @@ def seasonal_totals_with_coverage(daily_series, months, min_days=60):
 
 def plot_seasonal_lines_over_years(daily_series, title_fmt, ylabel):
     for season_name, months in seasons.items():
-        seasonal = seasonal_series(daily_series, months, agg="sum").dropna()
+        seasonal = seasonal_totals_with_coverage(daily_series, months, min_days=60).dropna()
 
         plt.figure()
         plt.plot(seasonal.index, seasonal.values, marker="o")
@@ -243,7 +321,7 @@ plot_seasonal_lines_over_years(
 )
 
 plot_seasonal_lines_over_years(
-    solar_daily_all,
+    solar_daily_kj_m2,
     title_fmt="Solar irradiation total per {season} (kJ/m²) over time",
     ylabel="Seasonal solar irradiation total (kJ/m²)"
 )
@@ -286,7 +364,7 @@ def seasonal_totals_boxplot(daily_series, seasons_dict, title, ylabel):
     seasonal_data, tick = [], []
 
     for season_name, months in seasons_dict.items():
-        season_totals = seasonal_series(daily_series, months, agg="sum").dropna()
+        season_totals = seasonal_totals_with_coverage(daily_series, months, min_days=60).dropna()
         seasonal_data.append(season_totals.values)
         tick.append(season_name)
 
@@ -320,14 +398,14 @@ seasonal_totals_boxplot(
 
 # ---- SOLAR: year-by-year boxplots of DAILY solar irradiation (kJ/m²/day)
 year_by_year_daily_boxplot(
-    solar_daily_all,
+    solar_daily_kj_m2, # continuous daily solar series; missing days filled with monthly median
     title="Solar irradiation: daily distribution by year (kJ/m²/day)",
     ylabel="Daily solar irradiation (kJ/m²/day)"
 )
 
 # ---- SOLAR: 4 seasonal boxes of SEASON TOTAL solar irradiation (kJ/m²) across years
 seasonal_totals_boxplot(
-    solar_daily_all,
+    solar_daily_kj_m2,
     seasons_dict=seasons,
     title="Solar irradiation: seasonal totals variability across years (kJ/m²/season)",
     ylabel="Seasonal solar irradiation total (kJ/m²)"
@@ -336,7 +414,7 @@ seasonal_totals_boxplot(
 # --- MINIMA (year + season) ---
 # Year totals (one value per year)
 rain_annual_totals = rain_daily_mm.resample("YE").sum(min_count=1).dropna()
-solar_annual_totals = solar_daily_all.resample("YE").sum(min_count=1).dropna()
+solar_annual_totals = solar_daily_kj_m2.resample("YE").sum(min_count=1).dropna()
 
 print("Min annual rain (mm):", rain_annual_totals.min(), "in", rain_annual_totals.idxmin().year)
 print("Min annual solar (kJ/m²):", solar_annual_totals.min(), "in", solar_annual_totals.idxmin().year)
@@ -344,8 +422,8 @@ print("Min annual solar (kJ/m²):", solar_annual_totals.min(), "in", solar_annua
 # Season totals per year (one value per year per season)
 season_mins = {}
 for season_name, months in seasons.items():
-    rain_season = seasonal_series(rain_daily_mm, months, agg="sum").dropna()
-    solar_season = seasonal_series(solar_daily_all, months, agg="sum").dropna()
+    rain_season = seasonal_totals_with_coverage(rain_daily_mm, months, min_days=60).dropna()
+    solar_season = seasonal_totals_with_coverage(solar_daily_kj_m2, months, min_days=60).dropna()
 
     season_mins[season_name] = {
         "rain_min_mm": float(rain_season.min()),
@@ -357,12 +435,6 @@ for season_name, months in seasons.items():
 print("\nSeason minimums (totals across years):")
 for k, v in season_mins.items():
     print(k, v)
-
-panel_area_m2 = area_typical
-net_kwh_day = gen_kwh_day - daily_demand_kwh
-
-battery_kwh, battery_drawdown, battery_cum = required_storage_from_net(net_kwh_day)
-print("Battery capacity needed (kWh):", battery_kwh)
 
 charging_days = (net_kwh_day > 0).sum()
 draining_days  = (net_kwh_day < 0).sum()
@@ -384,7 +456,7 @@ worst_winter_year = int(winter_net_by_year.idxmin())
 print("Worst winter net (kWh) in year:", worst_winter_year, "value:", float(winter_net_by_year.min()))
 
 def count_boxplot_outliers_by_year(daily_series, whisker=1.5, min_days=50):
-    """"
+    """
     Returns a DataFrame with per-year:
       n_days, q1, q3, iqr, lower_fence, upper_fence, n_outliers, pct_outliers
     Outliers are defined like matplotlib boxplots: outside [Q1 - w*IQR, Q3 + w*IQR].
