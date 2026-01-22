@@ -29,7 +29,9 @@ def parse_ob_end_time(series):
 # Posted by Gaurav Singh, modified by community. See post 'Timeline' for change history
 # Retrieved 2026-01-16, License - CC BY-SA 4.0
 
-# grabbing all the rain data from the many files within "rain_data"
+# -------------------------------------
+# RAIN DATA EXTRACTION AND ORGANISATION
+# -------------------------------------
 
 rain_path = 'rain_data' # use your path - all the rain.csv files are in this folder
 all_rain_files = glob.glob(os.path.join(rain_path , "*.csv")) # making a list of all csv files within the folder
@@ -37,7 +39,7 @@ all_rain_files = glob.glob(os.path.join(rain_path , "*.csv")) # making a list of
 def read_midas(rain_path):
     with open(rain_path, "r", encoding="utf-8", errors="ignore") as f:
         for i, line in enumerate(f):
-            if line.lower().startswith("ob_end_time"):
+            if line.lower().startswith("ob_end_time"): # going down until the actual start of the data as first few rows are not important for analysis
                 return pd.read_csv(rain_path, skiprows=i)
     raise ValueError(f"Header not found in {rain_path}")
 
@@ -46,11 +48,10 @@ for filename in all_rain_files:
     df = read_midas(filename)
     rain_list.append(df)
 
-rain_frame = pd.concat(rain_list, ignore_index=True)
+rain_frame = pd.concat(rain_list, ignore_index=True) # merge all the rows into one big data table
 
 rain_frame["ob_end_time"] = parse_ob_end_time(rain_frame["ob_end_time"])
 
-# (optional but recommended)
 rain_frame["prcp_amt"] = pd.to_numeric(rain_frame["prcp_amt"], errors="coerce")
 rain_frame["prcp_dur"] = pd.to_numeric(rain_frame["prcp_dur"], errors="coerce")
 rain_frame["ob_hour_count"] = pd.to_numeric(rain_frame["ob_hour_count"], errors="coerce")
@@ -73,11 +74,9 @@ rain_daily_mm = (
 annual_water_m3 = 200.0
 demand_m3_day = annual_water_m3 / 365.0
 
-# mm/day -> m/day; volume per m² per day
-rain_m3_m2_day = (rain_daily_mm / 1000.0)
+rain_m3_m2_day = (rain_daily_mm / 1000.0) # mm/day -> m/day; m³ per m² per day
 
-# Catchment sizing (m²) to meet 200 m³/yr using worst year
-rain_annual_mm = rain_daily_mm.resample("YE").sum(min_count=1).dropna()
+rain_annual_mm = rain_daily_mm.resample("YE").sum(min_count=1).dropna() # Catchment sizing (m²) to meet 200 m³/yr using worst year
 rain_annual_m3_per_m2 = rain_annual_mm / 1000.0  # m³ per m² per year
 
 catchment_required_by_year = annual_water_m3 / rain_annual_m3_per_m2
@@ -90,36 +89,34 @@ net_m3_day = inflow_m3_day - demand_m3_day
 tank_m3, tank_drawdown, tank_cum = required_storage_from_net(net_m3_day)
 print("Tank capacity needed based on worst rain (m³):", tank_m3)
 
-
 # 1mm of rain = 1L of water/m^2 of perfectly flat area.
 # therefore need an area that the rain is being collected in to reach the desired volume.
-# can imagine need something like 9m^2 of collection, i.e. 3mx3m bucket collecting rain
 
 # prcp_amt = precipitation 
 # prcp_dur = precipitation duration
 
-# grabbing all the solar data from the many files within "solar_data"
+# --------------------------------------
+# SOLAR DATA EXTRACTION AND ORGANISATION
+# --------------------------------------
 
 solar_path = 'solar_data' # use your path - all the solar.csv files are in this folder
 all_solar_files = glob.glob(os.path.join(solar_path , "*.csv")) # making a list of all csv files within the folder
 
 solar_list = []
 for filename in all_solar_files:
-    solar_df = read_midas(filename) # sending all the files through the function
+    solar_df = read_midas(filename)
     solar_list.append(solar_df)
 solar_frame = pd.concat(solar_list, axis=0, ignore_index=True) # stacking each individual csv file table into one big table
 
 solar_frame["ob_end_time"] = parse_ob_end_time(solar_frame["ob_end_time"])
 solar_frame = solar_frame.dropna(subset=["ob_end_time"]).copy()
 
-# make numeric + keep only true hourly rows
-solar_frame["ob_hour_count"] = pd.to_numeric(solar_frame["ob_hour_count"], errors="coerce")
+solar_frame["ob_hour_count"] = pd.to_numeric(solar_frame["ob_hour_count"], errors="coerce") # make numeric + keep only true hourly rows
 solar_frame["glbl_irad_amt"] = pd.to_numeric(solar_frame["glbl_irad_amt"], errors="coerce")
 
-# hourly rows (true hourly timestamps)
 solar_hourly = solar_frame[solar_frame["ob_hour_count"] == 1].dropna(
     subset=["ob_end_time", "glbl_irad_amt"]
-).copy()
+).copy() # hourly rows (true hourly timestamps)
 
 solar_hourly["hour"] = solar_hourly["ob_end_time"].dt.floor("h")
 
@@ -127,14 +124,11 @@ solar_hourly_hourly = (
     solar_hourly.groupby("hour")["glbl_irad_amt"].mean().sort_index()
 )
 
-# daily series made by summing hourly values
+solar_daily_from_hourly = solar_hourly_hourly.resample("D").sum(min_count=1) # daily series made by summing hourly values
 
-solar_daily_from_hourly = solar_hourly_hourly.resample("D").sum(min_count=1)
-
-# daily rows that exist in some years (often timestamped 23:59)
 solar_daily_direct = solar_frame[solar_frame["ob_hour_count"] == 24].dropna(
     subset=["ob_end_time", "glbl_irad_amt"]
-).copy()
+).copy() # daily rows that exist in some years (often timestamped 23:59)
 
 solar_daily_direct["date_solar"] = solar_daily_direct["ob_end_time"].dt.floor("D")
 
@@ -160,21 +154,23 @@ if len(daily_compare) >= 10:
 # now combine: prefer hourly-summed daily values, otherwise scaled daily-direct
 solar_daily_all = solar_daily_from_hourly.combine_first(solar_daily_direct).sort_index()
 
-# Solar main calculations
+# -----------------------
+# SOLAR MAIN CALCULATIONS
+# -----------------------
 
 pv_eff = 0.15 # efficiency
 annual_demand_kwh = 5000
 solar_daily_kj_m2 = solar_daily_all
 
-solar_kwh_m2 = solar_daily_kj_m2 / 3600.0         # kWh/m²/day incident
-solar_elec_kwh_m2 = solar_kwh_m2 * pv_eff          # kWh/m²/day electricity produced per m² of solar pannels
+solar_kwh_m2 = solar_daily_kj_m2 / 3600.0 # kWh/m²/day incident
+solar_elec_kwh_m2 = solar_kwh_m2 * pv_eff # kWh/m²/day electricity produced per m² of solar pannels
 
-solar_annual_per_m2 = solar_elec_kwh_m2.resample("YE").sum(min_count=1)  # kWh/m²/year
+solar_annual_per_m2 = solar_elec_kwh_m2.resample("YE").sum(min_count=1) # kWh/m²/year
 
 area_required_by_year = annual_demand_kwh / solar_annual_per_m2 # Area needed per year
 
 area_typical = area_required_by_year.median() # typical area required based on solar radiation in
-area_worst = area_required_by_year.max()   # worst solar year needs biggest area
+area_worst = area_required_by_year.max() # worst solar year needs biggest area
 area_p90 = area_required_by_year.quantile(0.9)
 
 daily_demand_kwh = annual_demand_kwh / 365.0
@@ -188,9 +184,9 @@ for label, panel_area_m2 in [("typical", area_typical), ("worst", area_worst)]:
 print("typical area required for solar pannels (m²)", area_typical)
 print("worst area required for solar pannels (m²)", area_worst)
 
-# -------------------------------
+# ------------------------------------
 # SEASONAL ANALYSIS PLOTS (OVER YEARS)
-# -------------------------------
+# ------------------------------------
 
 def seasonal_series(daily_series, months, agg="sum"):
     """
@@ -252,9 +248,9 @@ plot_seasonal_lines_over_years(
     ylabel="Seasonal solar irradiation total (kJ/m²)"
 )
 
-# -------------------------------
-# BOXPLOTS (robust across matplotlib versions)
-# -------------------------------
+# --------
+# BOXPLOTS
+# --------
 
 def year_by_year_daily_boxplot(daily_series, title, ylabel, min_days=50, max_years=30):
     s = daily_series.dropna().sort_index()
@@ -362,14 +358,12 @@ print("\nSeason minimums (totals across years):")
 for k, v in season_mins.items():
     print(k, v)
 
-panel_area_m2 = area_typical  # or area_worst, whichever you are presenting
-
+panel_area_m2 = area_typical
 net_kwh_day = gen_kwh_day - daily_demand_kwh
 
 battery_kwh, battery_drawdown, battery_cum = required_storage_from_net(net_kwh_day)
 print("Battery capacity needed (kWh):", battery_kwh)
 
-# For battery
 charging_days = (net_kwh_day > 0).sum()
 draining_days  = (net_kwh_day < 0).sum()
 print("Charging days:", charging_days, "Draining days:", draining_days)
@@ -384,13 +378,13 @@ def season_net_totals(net_series, seasons_dict):
 
 season_net = season_net_totals(net_kwh_day, seasons)
 
-winter_months = seasons["Winter"]  # [12,1,2]
+winter_months = seasons["Winter"]
 winter_net_by_year = seasonal_series(net_kwh_day, winter_months, agg="sum").dropna()
 worst_winter_year = int(winter_net_by_year.idxmin())
 print("Worst winter net (kWh) in year:", worst_winter_year, "value:", float(winter_net_by_year.min()))
 
 def count_boxplot_outliers_by_year(daily_series, whisker=1.5, min_days=50):
-    """
+    """"
     Returns a DataFrame with per-year:
       n_days, q1, q3, iqr, lower_fence, upper_fence, n_outliers, pct_outliers
     Outliers are defined like matplotlib boxplots: outside [Q1 - w*IQR, Q3 + w*IQR].
