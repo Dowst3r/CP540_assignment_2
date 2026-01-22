@@ -432,9 +432,9 @@ for season_name, months in seasons.items():
     solar_season = seasonal_totals_with_coverage(solar_daily_kj_m2, months, min_days=60).dropna()
 
     season_mins[season_name] = {
-        "rain_min_mm": float(rain_season.min()),
+        "rain_min_mm": f"{float(rain_season.min()):.1f} mm",
         "rain_min_year": int(rain_season.idxmin()),
-        "solar_min_kJm2": float(solar_season.min()),
+        "solar_min_kJm2": f"{float(solar_season.min()):.1f} kJ/m²",
         "solar_min_year": int(solar_season.idxmin()),
     }
 
@@ -451,7 +451,7 @@ def season_net_totals(net_series, seasons_dict):
     for season_name, months in seasons_dict.items():
         season_net = seasonal_series(net_series, months, agg="sum").dropna()
         out[season_name] = season_net
-        print(season_name, "median net:", float(season_net.median()), "kWh", "min net:", float(season_net.min()), "kWh")
+        print(season_name, "median net:", f"{float(season_net.median()):.3f} kWh", "min net:", f"{float(season_net.min()):.3f} kWh")
     return out
 
 season_net = season_net_totals(net_kwh_day, seasons)
@@ -459,7 +459,7 @@ season_net = season_net_totals(net_kwh_day, seasons)
 winter_months = seasons["Winter"]
 winter_net_by_year = seasonal_series(net_kwh_day, winter_months, agg="sum").dropna()
 worst_winter_year = int(winter_net_by_year.idxmin())
-print("Worst winter net in year:", worst_winter_year, "value:", float(winter_net_by_year.min()), "kWh")
+print("Worst winter net in year:", worst_winter_year, "value:", f"{float(winter_net_by_year.min()):.3f} kWh")
 
 def count_boxplot_outliers_by_year(daily_series, whisker=1.5, min_days=50):
     """
