@@ -7,9 +7,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 os.system("cls" if os.name == "nt" else "clear")
-SHOW_PLOTS = False
+SHOW_PLOTS = True
 
-# ^Life things up here, don't worry about what they do :)
+# switch to True if you want the graphs to show as the name suggests :)
 
 seasons = {"Spring":[3,4,5], "Summer":[6,7,8], "Autumn":[9,10,11], "Winter":[12,1,2]} # spring months = 1st March -> 31st May (https://weather.metoffice.gov.uk/learn-about/weather/seasons/spring)
 
@@ -115,14 +115,22 @@ rain_daily_mm = (
 annual_water_m3 = 200.0
 demand_m3_day = annual_water_m3 / 365.0
 
+# Keep a copy of the raw daily series (NaN = missing day)
+rain_daily_mm_raw = rain_daily_mm.asfreq("D")  # IMPORTANT: no fill_value, so missing stays NaN
+
+month_median_rain = rain_daily_mm_raw.groupby(rain_daily_mm_raw.index.month).transform("median")
+rain_daily_mm = rain_daily_mm_raw.fillna(month_median_rain)  # Fill missing days with the typical value for that calendar month (across all years)
+
+# If any NaNs remain (e.g., an entire month missing), fall back to overall median, then 0 as last resort
+rain_daily_mm = rain_daily_mm.fillna(rain_daily_mm_raw.median())
 rain_daily_mm = rain_daily_mm.fillna(0.0)
-rain_daily_mm = rain_daily_mm.asfreq("D", fill_value=0.0) # Ensure continuous daily series, any missing days = 0 mm rain
 
 rain_m3_m2_day = (rain_daily_mm / 1000.0) # mm/day -> m/day, which is the same as m³ per m² per day
 
 # -----------------------------------
 # 1: COLLECTOR SIZING, CATCHMENT AREA
 # -----------------------------------
+
 rain_annual_mm = rain_daily_mm.resample("YE").sum(min_count=1).dropna()
 rain_annual_m3_per_m2 = rain_annual_mm / 1000.0  # m/year which is the same as m3 per m2 per year
 
@@ -137,6 +145,9 @@ print(f"Worst-year catchment area (driest year): {catchment_worst:.2f} m² (driv
 
 catchment_area_m2 = catchment_worst
 
+catchment_area_typical_m2 = catchment_typical
+catchment_area_worst_m2 = catchment_worst
+
 # ------------------------------
 # 2: STORAGE SIZING, TANK VOLUME
 # ------------------------------
@@ -144,7 +155,18 @@ catchment_area_m2 = catchment_worst
 net_m3_day = (rain_m3_m2_day * catchment_area_m2) - demand_m3_day
 
 print("\nRAIN STORAGE (TANK) SIZING")
-tank_need_by_year, tank_design_m3, tank_design_year = report_storage_logic(net_m3_day, label="Tank", unit="m³")
+
+# Typical tank (using typical catchment area)
+net_m3_day_typical = (rain_m3_m2_day * catchment_area_typical_m2) - demand_m3_day
+tank_need_by_year_typ, tank_typ_m3, tank_typ_year = report_storage_logic(
+    net_m3_day_typical, label="Tank (typical catchment)", unit="m³"
+)
+
+# Worst tank (using worst/driest-year catchment area)
+net_m3_day_worst = (rain_m3_m2_day * catchment_area_worst_m2) - demand_m3_day
+tank_need_by_year_worst, tank_worst_m3, tank_worst_year = report_storage_logic(
+    net_m3_day_worst, label="Tank (worst catchment)", unit="m³"
+)
 
 # Helpful “why tank can go down” diagnostics:
 daily_inflow_m3 = rain_m3_m2_day * catchment_area_m2
@@ -230,6 +252,7 @@ solar_elec_kwh_m2 = solar_kwh_m2 * pv_eff
 # --------------------------------------
 # 1. COLLECTOR SIZING: SOLAR PANNEL AREA
 # --------------------------------------
+
 solar_annual_kwh_m2 = solar_elec_kwh_m2.resample("YE").sum(min_count=1).dropna()  # kWh/m²/year
 
 panel_typical, panel_worst, worst_solar_year_by_area = size_collector_area_from_annual_total(
@@ -242,17 +265,27 @@ print(f"Annual demand: {annual_demand_kwh:.0f} kWh/yr")
 print(f"Typical panel area (median year): {panel_typical:.2f} m²")
 print(f"Worst-year panel area (lowest solar year): {panel_worst:.2f} m² (driven by year {worst_solar_year_by_area})")
 
+# --- TYPICAL battery sizing (using typical/median panel area) ---
+panel_area_typical_m2 = panel_typical
+gen_kwh_day_typical = solar_elec_kwh_m2 * panel_area_typical_m2
+net_kwh_day_typical = gen_kwh_day_typical - daily_demand_kwh
+
+print("\nSOLAR STORAGE (BATTERY) SIZING")
+
+battery_need_by_year_typical, battery_typical_kwh, battery_typical_year = report_storage_logic(
+    net_kwh_day_typical, label="Battery (typical panel area)", unit="kWh"
+)
+
 panel_area_m2 = panel_worst
 
 # -----------------------------------
 # 2. STORAGE SIZING: BATTERY CAPACITY
 # -----------------------------------
+
 gen_kwh_day = solar_elec_kwh_m2 * panel_area_m2
 net_kwh_day = gen_kwh_day - daily_demand_kwh
 
-print("\nSOLAR STORAGE (BATTERY) SIZING")
 battery_need_by_year, battery_design_kwh, battery_design_year = report_storage_logic(net_kwh_day, label="Battery", unit="kWh")
-
 print(f"Median daily generation with this panel area: {gen_kwh_day.median():.2f} kWh/day")
 print(f"Worst single-day net (most negative): {net_kwh_day.min():.2f} kWh/day")
 
@@ -404,8 +437,14 @@ seasonal_totals_boxplot(
 
 # ---- SOLAR: year-by-year boxplots of DAILY solar irradiation (kJ/m²/day)
 year_by_year_daily_boxplot(
-    solar_daily_kj_m2, # continuous daily solar series; missing days filled with monthly median
-    title="Solar irradiation: daily distribution by year (kJ/m²/day)",
+    solar_daily_kj_m2[solar_daily_kj_m2.index.year <= 1976], # continuous daily solar series; missing days filled with monthly median for earlier than 1977
+    title="Solar irradiation: daily distribution (1967-1976) (kJ/m²/day)",
+    ylabel="Daily solar irradiation (kJ/m²/day)"
+)
+
+year_by_year_daily_boxplot(
+    solar_daily_kj_m2[solar_daily_kj_m2.index.year >= 1976],
+    title="Solar irradiation: daily distribution (1977-2006) (kJ/m²/day)",
     ylabel="Daily solar irradiation (kJ/m²/day)"
 )
 
